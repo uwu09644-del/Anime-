@@ -166,7 +166,8 @@ def surface(w=W, h=H):
 
 
 def to_array(surf):
-    return surf.makeImageSnapshot().toarray().astype(np.float32)
+    """Premultiplied RGBA float array (Skia's default export is unpremultiplied, which breaks 'over')."""
+    return surf.makeImageSnapshot().toarray(alphaType=skia.kPremul_AlphaType).astype(np.float32)
 
 
 # ---------------------------------------------------------------- 3D camera

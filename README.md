@@ -45,7 +45,9 @@ colour-traced lines, scene lighting, out-of-focus foregrounds.
 
 ![Before / after](cel/lookdev/before_after.png)
 
-Run `python cel/lookdev.py` to regenerate the test frames in `cel/lookdev/`.
+A 10-second moving test (camera push-in, flickering light, lip sync): [`cel/lookdev/look_test.mp4`](cel/lookdev/look_test.mp4).
+
+Run `python cel/lookdev.py` for the test frames and `python cel/testclip.py` for the clip.
 
 ## Build it yourself
 
