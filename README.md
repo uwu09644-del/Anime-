@@ -28,6 +28,25 @@ Cold open → opening title sequence with character cards → Part A (the beach)
 | Fonts | Dela Gothic One, M PLUS Rounded 1c, Kaisei Decol (SIL Open Font License) | free |
 | Encoding | **FFmpeg** (H.264 + AAC) | free |
 
+## Second show: FAULTLINE (original action anime)
+
+**▶ Episode 1 — "Rank F"** · [`faultline/episode01/FAULTLINE_EP01.mp4`](faultline/episode01/FAULTLINE_EP01.mp4) (≈3 min)
+
+Kai Arisawa, a Rank-F salvager who cleans up after monster hunters, is trapped when a new fracture
+opens in a subway dungeon, and discovers he can see the fault lines running through everything.
+Code: [`faultline/`](faultline/) (characters, backgrounds, effects, score, episode).
+Build: `python studio/render.py --show faultline.ep01`
+
+## Look test: painted backgrounds + cel characters
+
+The first two episodes look like motion graphics, not TV anime. [`cel/`](cel/) is a prototype of a
+closer look: painted-style backgrounds mapped in true perspective, natural body proportions, thin
+colour-traced lines, scene lighting, out-of-focus foregrounds.
+
+![Before / after](cel/lookdev/before_after.png)
+
+Run `python cel/lookdev.py` to regenerate the test frames in `cel/lookdev/`.
+
 ## Build it yourself
 
 ```bash
