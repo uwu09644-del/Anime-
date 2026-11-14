@@ -8,11 +8,17 @@ A Windows desktop app for finding, downloading and reading manga. It is written 
 
 Search and chapters come from the public [MangaDex](https://mangadex.org) API. Licensed series often have no chapters there, so read those on the official sites.
 
-## Start it
+## Install or update
 
-1. Download this `manga-shelf` folder to your PC.
-2. Double-click **`Start-MangaShelf.bat`**.
-3. Optional: right-click **`Create-DesktopShortcut.ps1`** and choose **Run with PowerShell**. This adds a MangaShelf icon to your Desktop and Start menu.
+Open **Windows PowerShell** and paste:
+
+```
+[Net.ServicePointManager]::SecurityProtocol=0; irm https://raw.githubusercontent.com/uwu09644-del/Anime-/claude/fervent-lovelace-ftj9pi/manga-shelf/Install-MangaShelf.ps1 | iex
+```
+
+This puts the app in `C:\Users\<you>\MangaShelf`, adds a **MangaShelf** icon to your Desktop and Start menu, and opens it. Run the same command again any time to update. Your manga is kept.
+
+If the app won't open, run `Debug-MangaShelf.bat` in that folder to see the error.
 
 Manga is saved to `C:\Users\<you>\Manga\<Series>\Chapter 0001\001.jpg`. To use a different folder, run:
 
