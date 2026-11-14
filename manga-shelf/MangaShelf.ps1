@@ -20,6 +20,16 @@ if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
 }
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
+
+# If anything crashes, show the error and save it instead of closing silently.
+trap {
+    $msg = "MangaShelf crashed:`n`n$($_.Exception.Message)`n`nLine $($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.Line.Trim())"
+    $log = Join-Path $env:TEMP 'MangaShelf-error.txt'
+    try { [IO.File]::WriteAllText($log, "$msg`n`n$($_.ScriptStackTrace)") } catch { }
+    [void][System.Windows.MessageBox]::Show("$msg`n`n(Saved to $log)", 'MangaShelf error')
+    exit 1
+}
+
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 $Api      = 'https://api.mangadex.org'
