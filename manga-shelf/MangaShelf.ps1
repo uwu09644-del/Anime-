@@ -19,7 +19,50 @@ if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
     return
 }
 
-Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
+Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Xaml
+
+# Small C# helper: loads images from disk into memory (no file locks, works with any file name)
+if (-not ('MangaShelf.ImageLoader' -as [type])) {
+    $refs = [AppDomain]::CurrentDomain.GetAssemblies() |
+            Where-Object { $_.Location -and (@('PresentationCore', 'PresentationFramework', 'WindowsBase', 'System.Xaml') -contains $_.GetName().Name) } |
+            ForEach-Object { $_.Location }
+    Add-Type -ReferencedAssemblies $refs -TypeDefinition @'
+using System;
+using System.Globalization;
+using System.IO;
+using System.Windows.Data;
+using System.Windows.Media.Imaging;
+namespace MangaShelf {
+    public static class ImageLoader {
+        public static BitmapImage Load(string path, int decodeWidth) {
+            if (string.IsNullOrEmpty(path) || !File.Exists(path)) return null;
+            try {
+                var bmp = new BitmapImage();
+                using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)) {
+                    bmp.BeginInit();
+                    bmp.CacheOption = BitmapCacheOption.OnLoad;
+                    bmp.CreateOptions = BitmapCreateOptions.IgnoreColorProfile;
+                    if (decodeWidth > 0) bmp.DecodePixelWidth = decodeWidth;
+                    bmp.StreamSource = fs;
+                    bmp.EndInit();
+                }
+                bmp.Freeze();
+                return bmp;
+            } catch { return null; }
+        }
+    }
+    public class PathToImageConverter : IValueConverter {
+        public int DecodeWidth { get; set; }
+        public object Convert(object value, Type targetType, object parameter, CultureInfo culture) {
+            return value == null ? null : ImageLoader.Load(value.ToString(), DecodeWidth);
+        }
+        public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture) {
+            throw new NotSupportedException();
+        }
+    }
+}
+'@
+}
 
 # If anything crashes, show the error and save it instead of closing silently.
 trap {
@@ -91,7 +134,7 @@ function Get-MangaTitle($attrs) {
 
 # ---------------------------------------------------------------- background downloader
 # Runs in its own runspace so the window never freezes. Talks to the UI through $sync.
-$sync  = [hashtable]::Synchronized(@{ Status = 'Ready'; Progress = 0; LibraryChanged = $false; Gen = 0; CurrentId = $null; Quit = $false })
+$sync  = [hashtable]::Synchronized(@{ CoversChanged = $false; Status = 'Ready'; Progress = 0; LibraryChanged = $false; Gen = 0; CurrentId = $null; Quit = $false })
 $queue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
 
 $worker = {
@@ -232,6 +275,34 @@ $ps = [powershell]::Create()
 $ps.Runspace = $rs
 [void]$ps.AddScript($worker.ToString()).AddArgument($sync).AddArgument($queue).AddArgument($Library).AddArgument($UA).AddArgument($Api).AddArgument($TlsModes)
 [void]$ps.BeginInvoke()
+
+# Second background worker: downloads cover pictures for search results
+$CoverCache = Join-Path $env:TEMP 'MangaShelf-covers'
+[void][IO.Directory]::CreateDirectory($CoverCache)
+$coverQueue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+$coverWorker = {
+    param($sync, $coverQueue, $UA)
+    while (-not $sync.Quit) {
+        $job = $null
+        if (-not $coverQueue.TryDequeue([ref]$job)) { Start-Sleep -Milliseconds 150; continue }
+        if ([IO.File]::Exists($job.Out)) { $sync.CoversChanged = $true; continue }
+        $wc = New-Object Net.WebClient
+        try {
+            $wc.Headers.Add('User-Agent', $UA)
+            $wc.DownloadFile($job.Url, "$($job.Out).part")
+            [IO.File]::Move("$($job.Out).part", $job.Out)
+            $sync.CoversChanged = $true
+        } catch {
+            try { [IO.File]::Delete("$($job.Out).part") } catch { }
+        } finally { $wc.Dispose() }
+    }
+}
+$rs2 = [runspacefactory]::CreateRunspace()
+$rs2.Open()
+$ps2 = [powershell]::Create()
+$ps2.Runspace = $rs2
+[void]$ps2.AddScript($coverWorker.ToString()).AddArgument($sync).AddArgument($coverQueue).AddArgument($UA)
+[void]$ps2.BeginInvoke()
 
 function Queue-Download($id, $title, $lang, $coverUrl) {
     if ($sync.CurrentId -eq $id -or ($queue.ToArray() | Where-Object { $_.Id -eq $id })) {
@@ -404,11 +475,6 @@ $ReaderXaml = @'
           </Setter>
         </Style>
       </ListBox.ItemContainerStyle>
-      <ListBox.ItemTemplate>
-        <DataTemplate>
-          <Image Source="{Binding File}" Width="{Binding Value, ElementName=Zoom}" Stretch="Uniform"/>
-        </DataTemplate>
-      </ListBox.ItemTemplate>
     </ListBox>
   </DockPanel>
 </Window>
@@ -432,7 +498,7 @@ function Refresh-Library {
         [pscustomobject]@{
             Name  = $d.Name
             Dir   = $d.FullName
-            Cover = $(if ([IO.File]::Exists($cover)) { $cover } else { $null })
+            Cover = [MangaShelf.ImageLoader]::Load($cover, 160)
             Info  = "$($chs.Count) chapters, $read read"
         }
     })
@@ -497,6 +563,19 @@ function Open-Reader([int]$index) {
         Pages = $rw.FindName('Pages'); Title = $rw.FindName('ChTitle')
         Prev = $rw.FindName('PrevBtn'); Next = $rw.FindName('NextBtn'); Next2 = $rw.FindName('NextBtn2')
     }
+    # Page template: picture loaded from disk, width follows the zoom slider
+    $img = New-Object System.Windows.FrameworkElementFactory([System.Windows.Controls.Image])
+    $srcBinding = New-Object System.Windows.Data.Binding('File')
+    $srcBinding.Converter = New-Object MangaShelf.PathToImageConverter
+    $img.SetBinding([System.Windows.Controls.Image]::SourceProperty, $srcBinding)
+    $wBinding = New-Object System.Windows.Data.Binding('Value')
+    $wBinding.Source = $rw.FindName('Zoom')
+    $img.SetBinding([System.Windows.FrameworkElement]::WidthProperty, $wBinding)
+    $img.SetValue([System.Windows.Controls.Image]::StretchProperty, [System.Windows.Media.Stretch]::Uniform)
+    $tpl = New-Object System.Windows.DataTemplate
+    $tpl.VisualTree = $img
+    $script:R.Pages.ItemTemplate = $tpl
+
     $script:R.Prev.Add_Click({ Show-Chapter ($script:R.Index - 1) })
     $script:R.Next.Add_Click({ Show-Chapter ($script:R.Index + 1) })
     $script:R.Next2.Add_Click({ Show-Chapter ($script:R.Index + 1) })
@@ -534,13 +613,20 @@ function Search-Manga {
             [pscustomobject]@{
                 Id       = $m.id
                 Title    = Get-MangaTitle $a
-                Cover    = $(if ($file) { "https://uploads.mangadex.org/covers/$($m.id)/$file.256.jpg" } else { $null })
+                Cover    = $null
+                CoverUrl = $(if ($file) { "https://uploads.mangadex.org/covers/$($m.id)/$file.256.jpg" } else { $null })
+                CoverFile = (Join-Path $CoverCache "$($m.id).jpg")
                 CoverBig = $(if ($file) { "https://uploads.mangadex.org/covers/$($m.id)/$file.512.jpg" } else { $null })
                 Info     = ($bits -join '  |  ')
                 Desc     = $desc
                 Lang     = $lang
             }
         })
+        foreach ($it in $items) {
+            if ([IO.File]::Exists($it.CoverFile)) { $it.Cover = [MangaShelf.ImageLoader]::Load($it.CoverFile, 170) }
+            elseif ($it.CoverUrl) { $coverQueue.Enqueue([pscustomobject]@{ Url = $it.CoverUrl; Out = $it.CoverFile }) }
+        }
+        $script:SearchItems = $items
         $Results.ItemsSource = $items
         $Status.Text = if ($items.Count) { "$($r.total) results. Select one and press 'Download to library'." } else { "Nothing found for '$q' in '$lang'." }
     } catch {
@@ -598,6 +684,17 @@ $timer.Add_Tick({
     if ($sync.CurrentId -or $sync.LibraryChanged -or $queue.Count) {
         $Status.Text = $sync.Status
         $Progress.Value = $sync.Progress
+    }
+    if ($sync.CoversChanged) {
+        $sync.CoversChanged = $false
+        $changed = $false
+        foreach ($it in @($script:SearchItems)) {
+            if ($it -and -not $it.Cover -and [IO.File]::Exists($it.CoverFile)) {
+                $it.Cover = [MangaShelf.ImageLoader]::Load($it.CoverFile, 170)
+                $changed = $true
+            }
+        }
+        if ($changed) { $Results.Items.Refresh() }
     }
     if ($sync.LibraryChanged) {
         $sync.LibraryChanged = $false
