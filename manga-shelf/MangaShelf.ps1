@@ -30,7 +30,27 @@ trap {
     exit 1
 }
 
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+# Secure connection settings. Let Windows pick (TLS 1.3 on Windows 11); fall back if that fails.
+$TlsModes = @(
+    [Net.SecurityProtocolType]0,                    # Windows default (TLS 1.2 / 1.3)
+    [Net.SecurityProtocolType](3072 -bor 12288),    # TLS 1.2 + TLS 1.3
+    [Net.SecurityProtocolType]3072                  # TLS 1.2 only
+)
+try { [Net.ServicePointManager]::SecurityProtocol = $TlsModes[0] } catch { }
+
+# Web request that retries with other TLS settings on "Could not create SSL/TLS secure channel"
+function Invoke-MD([string]$url, [int]$timeout = 20) {
+    $lastErr = $null
+    foreach ($mode in (@($null) + $TlsModes)) {
+        if ($null -ne $mode) { try { [Net.ServicePointManager]::SecurityProtocol = $mode } catch { continue } }
+        try { return Invoke-RestMethod -Uri $url -UserAgent $UA -TimeoutSec $timeout }
+        catch {
+            $lastErr = $_
+            if ("$($_.Exception.Message)" -notmatch 'SSL|TLS|secure channel|underlying connection') { throw }
+        }
+    }
+    throw $lastErr
+}
 
 $Api      = 'https://api.mangadex.org'
 $UA       = 'MangaShelf/1.0 (personal desktop reader)'
@@ -75,13 +95,18 @@ $sync  = [hashtable]::Synchronized(@{ Status = 'Ready'; Progress = 0; LibraryCha
 $queue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
 
 $worker = {
-    param($sync, $queue, $Library, $UA, $Api)
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    param($sync, $queue, $Library, $UA, $Api, $TlsModes)
 
     function Call-Api([string]$path) {
         for ($try = 1; $try -le 5; $try++) {
             try {
-                $r = Invoke-RestMethod -Uri ($Api + $path) -UserAgent $UA -TimeoutSec 30
+                $r = $null
+                foreach ($mode in (@($null) + $TlsModes)) {
+                    if ($null -ne $mode) { try { [Net.ServicePointManager]::SecurityProtocol = $mode } catch { continue } }
+                    try { $r = Invoke-RestMethod -Uri ($Api + $path) -UserAgent $UA -TimeoutSec 30; break }
+                    catch { if ("$($_.Exception.Message)" -notmatch 'SSL|TLS|secure channel|underlying connection') { throw } }
+                }
+                if ($null -eq $r) { throw 'TLS connection failed' }
                 Start-Sleep -Milliseconds 250          # stay well under MangaDex rate limits
                 return $r
             } catch { Start-Sleep -Seconds (3 * $try) }
@@ -205,7 +230,7 @@ $rs = [runspacefactory]::CreateRunspace()
 $rs.Open()
 $ps = [powershell]::Create()
 $ps.Runspace = $rs
-[void]$ps.AddScript($worker.ToString()).AddArgument($sync).AddArgument($queue).AddArgument($Library).AddArgument($UA).AddArgument($Api)
+[void]$ps.AddScript($worker.ToString()).AddArgument($sync).AddArgument($queue).AddArgument($Library).AddArgument($UA).AddArgument($Api).AddArgument($TlsModes)
 [void]$ps.BeginInvoke()
 
 function Queue-Download($id, $title, $lang, $coverUrl) {
@@ -498,7 +523,7 @@ function Search-Manga {
     try {
         $url = "$Api/manga?title=$([uri]::EscapeDataString($q))&limit=40&includes[]=cover_art" +
                "&availableTranslatedLanguage[]=$lang&contentRating[]=safe&contentRating[]=suggestive&order[relevance]=desc"
-        $r = Invoke-RestMethod -Uri $url -UserAgent $UA -TimeoutSec 20
+        $r = Invoke-MD $url
         $items = @(foreach ($m in $r.data) {
             $a = $m.attributes
             $art = $m.relationships | Where-Object { $_.type -eq 'cover_art' } | Select-Object -First 1
@@ -520,7 +545,7 @@ function Search-Manga {
         $Status.Text = if ($items.Count) { "$($r.total) results. Select one and press 'Download to library'." } else { "Nothing found for '$q' in '$lang'." }
     } catch {
         $Status.Text = 'Search failed.'
-        Show-Msg "Search failed: $($_.Exception.Message)`n`nCheck your internet connection."
+        Show-Msg "Search failed: $($_.Exception.Message)`n`nCheck that https://mangadex.org opens in your web browser. If it does not, your network or antivirus may be blocking it."
     } finally {
         $win.Cursor = $null
     }
