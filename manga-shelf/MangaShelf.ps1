@@ -20,6 +20,7 @@ if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
 }
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Xaml
+Add-Type -AssemblyName Microsoft.VisualBasic, System.Windows.Forms
 
 # Small C# helper: loads images from disk into memory (no file locks, works with any file name)
 if (-not ('MangaShelf.ImageLoader' -as [type])) {
@@ -134,7 +135,7 @@ function Get-MangaTitle($attrs) {
 
 # ---------------------------------------------------------------- background downloader
 # Runs in its own runspace so the window never freezes. Talks to the UI through $sync.
-$sync  = [hashtable]::Synchronized(@{ CoversChanged = $false; Status = 'Ready'; Progress = 0; LibraryChanged = $false; Gen = 0; CurrentId = $null; Quit = $false })
+$sync  = [hashtable]::Synchronized(@{ InfoChanged = $false; Counts = [hashtable]::Synchronized(@{}); CoversChanged = $false; Status = 'Ready'; Progress = 0; LibraryChanged = $false; Gen = 0; CurrentId = $null; Quit = $false })
 $queue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
 
 $worker = {
@@ -187,10 +188,63 @@ $worker = {
         return 'Extra - ' + (Clean-Name $t)
     }
 
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $imgExt = @('.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp')
+    function Nat([string]$s) { [regex]::Replace($s, '\d+', { param($m) $m.Value.PadLeft(10, '0') }) }
+
+    # Import CBZ/ZIP files and image folders the user already owns
+    function Import-Job($job) {
+        $dir = Join-Path $Library (Clean-Name $job.Series)
+        [void][IO.Directory]::CreateDirectory($dir)
+        $items = @($job.Items); $n = 0
+        foreach ($src in $items) {
+            if ($job.Gen -ne $sync.Gen -or $sync.Quit) { break }
+            $n++
+            $sync.Progress = [int](100 * ($n - 1) / $items.Count)
+            $isFile = [IO.File]::Exists($src)
+            $name = if ($isFile) { [IO.Path]::GetFileNameWithoutExtension($src) } else { [IO.Path]::GetFileName($src.TrimEnd('\')) }
+            $name = Clean-Name $name
+            $sync.Status = "Importing $name ($n/$($items.Count))..."
+            $cdir = Join-Path $dir $name
+            [void][IO.Directory]::CreateDirectory($cdir)
+            $p = 0
+            if ($isFile) {
+                $zip = [IO.Compression.ZipFile]::OpenRead($src)
+                try {
+                    $entries = @($zip.Entries | Where-Object { $_.Name -and ($imgExt -contains [IO.Path]::GetExtension($_.Name).ToLower()) } |
+                                 Sort-Object { Nat $_.FullName })
+                    foreach ($e in $entries) {
+                        $p++
+                        $out = Join-Path $cdir ('{0:D3}{1}' -f $p, [IO.Path]::GetExtension($e.Name).ToLower())
+                        [IO.Compression.ZipFileExtensions]::ExtractToFile($e, $out, $true)
+                    }
+                } finally { $zip.Dispose() }
+            } else {
+                $files = @(Get-ChildItem -LiteralPath $src -File | Where-Object { $imgExt -contains $_.Extension.ToLower() } | Sort-Object { Nat $_.Name })
+                foreach ($f in $files) {
+                    $p++
+                    Copy-Item -LiteralPath $f.FullName -Destination (Join-Path $cdir ('{0:D3}{1}' -f $p, $f.Extension.ToLower())) -Force
+                }
+            }
+            if ($p -gt 0) { [IO.File]::WriteAllText((Join-Path $cdir '.done'), '') }
+            else { try { [IO.Directory]::Delete($cdir) } catch { } }
+            $sync.LibraryChanged = $true
+        }
+        $sync.Progress = 100
+        $sync.Status = "Imported $n item(s) into '$($job.Series)'."
+    }
+
     while (-not $sync.Quit) {
         $job = $null
         if (-not $queue.TryDequeue([ref]$job)) { Start-Sleep -Milliseconds 300; continue }
         if ($job.Gen -ne $sync.Gen) { continue }       # cancelled before it started
+
+        if ($job.Type -eq 'import') {
+            $sync.CurrentId = 'import'
+            try { Import-Job $job } catch { $sync.Status = "Import failed: $($_.Exception.Message)" }
+            finally { $sync.CurrentId = $null; $sync.LibraryChanged = $true }
+            continue
+        }
 
         $sync.CurrentId = $job.Id
         $sync.Progress = 0
@@ -281,10 +335,20 @@ $CoverCache = Join-Path $env:TEMP 'MangaShelf-covers'
 [void][IO.Directory]::CreateDirectory($CoverCache)
 $coverQueue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
 $coverWorker = {
-    param($sync, $coverQueue, $UA)
+    param($sync, $coverQueue, $UA, $Api)
     while (-not $sync.Quit) {
         $job = $null
         if (-not $coverQueue.TryDequeue([ref]$job)) { Start-Sleep -Milliseconds 150; continue }
+        if ($job.Type -eq 'count') {
+            try {
+                $r = Invoke-RestMethod -UserAgent $UA -TimeoutSec 20 -Uri ("$Api/manga/$($job.Id)/feed?translatedLanguage[]=$($job.Lang)" +
+                     "&includeExternalUrl=0&limit=1&contentRating[]=safe&contentRating[]=suggestive&contentRating[]=erotica")
+                $sync.Counts[$job.Key] = [int]$r.total
+            } catch { $sync.Counts[$job.Key] = -2 }
+            $sync.InfoChanged = $true
+            Start-Sleep -Milliseconds 250
+            continue
+        }
         if ([IO.File]::Exists($job.Out)) { $sync.CoversChanged = $true; continue }
         $wc = New-Object Net.WebClient
         try {
@@ -301,7 +365,7 @@ $rs2 = [runspacefactory]::CreateRunspace()
 $rs2.Open()
 $ps2 = [powershell]::Create()
 $ps2.Runspace = $rs2
-[void]$ps2.AddScript($coverWorker.ToString()).AddArgument($sync).AddArgument($coverQueue).AddArgument($UA)
+[void]$ps2.AddScript($coverWorker.ToString()).AddArgument($sync).AddArgument($coverQueue).AddArgument($UA).AddArgument($Api)
 [void]$ps2.BeginInvoke()
 
 function Queue-Download($id, $title, $lang, $coverUrl) {
@@ -345,6 +409,8 @@ $MainXaml = @'
               <TextBlock Text="My manga" Foreground="#EEEEEE" FontSize="20" FontWeight="Bold" VerticalAlignment="Center" Margin="4,0,12,0"/>
               <Button x:Name="RefreshBtn" Content="Refresh"/>
               <Button x:Name="FolderBtn" Content="Open folder"/>
+              <Button x:Name="ImportBtn" Content="Import files..."/>
+              <Button x:Name="ImportDirBtn" Content="Import folder..."/>
             </StackPanel>
             <ListBox x:Name="SeriesList" Background="#252526" BorderThickness="0" HorizontalContentAlignment="Stretch"
                      ScrollViewer.HorizontalScrollBarVisibility="Disabled">
@@ -409,6 +475,7 @@ $MainXaml = @'
           </DockPanel>
           <DockPanel DockPanel.Dock="Bottom">
             <Button x:Name="DownloadBtn" DockPanel.Dock="Right" Content="Download to library" FontSize="14" FontWeight="Bold"/>
+            <Button x:Name="OfficialBtn" DockPanel.Dock="Right" Content="Official links"/>
             <TextBlock Text="Search and chapters provided by MangaDex and its scanlation groups. Please support official releases."
                        Foreground="#777777" VerticalAlignment="Center" TextWrapping="Wrap"/>
           </DockPanel>
@@ -426,7 +493,8 @@ $MainXaml = @'
                   </Border>
                   <StackPanel Grid.Column="1">
                     <TextBlock Text="{Binding Title}" Foreground="#FFFFFF" FontSize="17" FontWeight="Bold" TextWrapping="Wrap"/>
-                    <TextBlock Text="{Binding Info}" Foreground="#88CCFF" Margin="0,2,0,4"/>
+                    <TextBlock Text="{Binding Info}" Foreground="#88CCFF" Margin="0,2,0,0"/>
+                    <TextBlock Text="{Binding Avail}" Foreground="{Binding AvailColor}" FontWeight="Bold" Margin="0,2,0,4"/>
                     <TextBlock Text="{Binding Desc}" Foreground="#BBBBBB" TextWrapping="Wrap" MaxHeight="66" TextTrimming="WordEllipsis"/>
                   </StackPanel>
                 </Grid>
@@ -482,7 +550,7 @@ $ReaderXaml = @'
 
 $win = Load-Xaml $MainXaml
 foreach ($n in 'CancelBtn', 'Progress', 'Status', 'Tabs', 'RefreshBtn', 'FolderBtn', 'SeriesList', 'SeriesTitle',
-               'ContinueBtn', 'ReadBtn', 'UpdateBtn', 'ChapterList', 'SearchBtn', 'LangBox', 'SearchBox', 'DownloadBtn', 'Results') {
+               'ContinueBtn', 'ReadBtn', 'UpdateBtn', 'ChapterList', 'SearchBtn', 'LangBox', 'SearchBox', 'DownloadBtn', 'Results', 'OfficialBtn', 'ImportBtn', 'ImportDirBtn') {
     Set-Variable -Name $n -Value $win.FindName($n) -Scope Script
 }
 
@@ -620,11 +688,20 @@ function Search-Manga {
                 Info     = ($bits -join '  |  ')
                 Desc     = $desc
                 Lang     = $lang
+                Links    = $a.links
+                Count    = -1
+                Avail    = 'Checking chapters...'
+                AvailColor = '#AAAAAA'
             }
         })
         foreach ($it in $items) {
             if ([IO.File]::Exists($it.CoverFile)) { $it.Cover = [MangaShelf.ImageLoader]::Load($it.CoverFile, 170) }
             elseif ($it.CoverUrl) { $coverQueue.Enqueue([pscustomobject]@{ Url = $it.CoverUrl; Out = $it.CoverFile }) }
+        }
+        foreach ($it in $items) {
+            $key = "$($it.Id)|$lang"
+            if ($sync.Counts.ContainsKey($key)) { Set-Avail $it $sync.Counts[$key] }
+            else { $coverQueue.Enqueue([pscustomobject]@{ Type = 'count'; Id = $it.Id; Lang = $lang; Key = $key }) }
         }
         $script:SearchItems = $items
         $Results.ItemsSource = $items
@@ -637,10 +714,85 @@ function Search-Manga {
     }
 }
 
+function Set-Avail($it, [int]$n) {
+    $it.Count = $n
+    if ($n -gt 0)      { $it.Avail = "Downloadable ($n chapter uploads in $($it.Lang))"; $it.AvailColor = '#66DD66' }
+    elseif ($n -eq 0)  { $it.Avail = "Not downloadable here (licensed) - use 'Official links'"; $it.AvailColor = '#FF7777' }
+    else               { $it.Avail = "Could not check chapters"; $it.AvailColor = '#AAAAAA' }
+}
+
+function Open-Official($m) {
+    if (-not $m) { Show-Msg 'Select a manga from the results first.'; return }
+    $url = $null
+    if ($m.Links) {
+        foreach ($k in 'engtl', 'amz', 'raw', 'cdj', 'ebj') {
+            $v = "$($m.Links.$k)"
+            if ($v -match '^https?://') { $url = $v; break }
+        }
+    }
+    if (-not $url) { $url = "https://mangadex.org/title/$($m.Id)" }   # MangaDex page lists where to buy/read
+    Start-Process $url
+}
+
 function Download-Selected {
     $m = $Results.SelectedItem
     if (-not $m) { Show-Msg 'Select a manga from the results first.'; return }
+    if ($m.Count -eq 0) {
+        $ans = [System.Windows.MessageBox]::Show("'$($m.Title)' has no downloadable chapters in '$($m.Lang)' (it is officially licensed).`n`nOpen the official site in your browser instead?",
+                                                 'MangaShelf', 'YesNo', 'Information')
+        if ("$ans" -eq 'Yes') { Open-Official $m }
+        return
+    }
     Queue-Download $m.Id $m.Title $m.Lang $m.CoverBig
+}
+
+# ---------------------------------------------------------------- import your own files
+function Guess-SeriesName([string]$path) {
+    $n = [IO.Path]::GetFileNameWithoutExtension($path.TrimEnd('\'))
+    $n = $n -replace '\[[^\]]*\]|\([^)]*\)|\{[^}]*\}', ' '
+    $n = $n -replace '(?i)[\s_.-]+(v|vol|volume|c|ch|chap|chapter|#)\.?\s*\d+.*$', ''
+    $n = ($n -replace '[_.]', ' ' -replace '\s+', ' ').Trim(' -')
+    return $n
+}
+
+function Has-Images([string]$dir) {
+    [bool](Get-ChildItem -LiteralPath $dir -File | Where-Object { $ImgExt -contains $_.Extension.ToLower() } | Select-Object -First 1)
+}
+
+function Start-Import([string[]]$paths, [string]$guessFrom) {
+    $paths = @($paths | Where-Object { $_ })
+    if ($paths.Count -eq 0) { return }
+    $series = [Microsoft.VisualBasic.Interaction]::InputBox(
+        "Which manga is this?`n`n$($paths.Count) item(s) will be added to your Library under this name. Each file or folder becomes one chapter/volume.",
+        'MangaShelf - Import', (Guess-SeriesName $guessFrom))
+    if (-not $series -or -not $series.Trim()) { return }
+    $queue.Enqueue([pscustomobject]@{ Type = 'import'; Series = $series.Trim(); Items = $paths; Gen = $sync.Gen; Id = $null; Title = $series.Trim() })
+    $Status.Text = "Importing into '$($series.Trim())'..."
+    $Tabs.SelectedIndex = 0
+}
+
+function Import-Files {
+    $dlg = New-Object Microsoft.Win32.OpenFileDialog
+    $dlg.Title = 'Pick CBZ / ZIP files to import'
+    $dlg.Filter = 'Comic archives (*.cbz;*.zip)|*.cbz;*.zip'
+    $dlg.Multiselect = $true
+    if ($dlg.ShowDialog($win)) {
+        $files = @($dlg.FileNames | ForEach-Object { Get-Item -LiteralPath $_ } | NatSort | ForEach-Object { $_.FullName })
+        Start-Import $files $files[0]
+    }
+}
+
+function Import-Folder {
+    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dlg.Description = 'Pick a folder with CBZ/ZIP files, or with chapter folders full of images'
+    if ($dlg.ShowDialog() -ne 'OK') { return }
+    $root = $dlg.SelectedPath
+    $items = @()
+    $items += @(Get-ChildItem -LiteralPath $root -File | Where-Object { @('.cbz', '.zip') -contains $_.Extension.ToLower() } | NatSort | ForEach-Object { $_.FullName })
+    $items += @(Get-ChildItem -LiteralPath $root -Directory | NatSort | Where-Object { Has-Images $_.FullName } | ForEach-Object { $_.FullName })
+    if (Has-Images $root) { $items += $root }
+    if ($items.Count -eq 0) { Show-Msg "No CBZ/ZIP files or image folders found in:`n$root"; return }
+    Start-Import $items $root
 }
 
 # ---------------------------------------------------------------- wire up events
@@ -648,6 +800,9 @@ $SearchBtn.Add_Click({ Search-Manga })
 $SearchBox.Add_KeyDown({ param($s, $e) if ($e.Key -eq 'Return') { Search-Manga } })
 $DownloadBtn.Add_Click({ Download-Selected })
 $Results.Add_MouseDoubleClick({ Download-Selected })
+$OfficialBtn.Add_Click({ Open-Official $Results.SelectedItem })
+$ImportBtn.Add_Click({ Import-Files })
+$ImportDirBtn.Add_Click({ Import-Folder })
 
 $RefreshBtn.Add_Click({ Refresh-Library })
 $FolderBtn.Add_Click({ Start-Process explorer.exe -ArgumentList "`"$Library`"" })
@@ -693,6 +848,15 @@ $timer.Add_Tick({
                 $it.Cover = [MangaShelf.ImageLoader]::Load($it.CoverFile, 170)
                 $changed = $true
             }
+        }
+        if ($changed) { $Results.Items.Refresh() }
+    }
+    if ($sync.InfoChanged) {
+        $sync.InfoChanged = $false
+        $changed = $false
+        foreach ($it in @($script:SearchItems)) {
+            $key = "$($it.Id)|$($it.Lang)"
+            if ($it -and $it.Count -eq -1 -and $sync.Counts.ContainsKey($key)) { Set-Avail $it $sync.Counts[$key]; $changed = $true }
         }
         if ($changed) { $Results.Items.Refresh() }
     }
