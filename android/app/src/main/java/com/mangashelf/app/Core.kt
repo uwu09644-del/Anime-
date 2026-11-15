@@ -3,6 +3,8 @@ package com.mangashelf.app
 import android.app.Application
 import android.content.Context
 import android.content.SharedPreferences
+import android.net.Uri
+import androidx.documentfile.provider.DocumentFile
 import coil.ImageLoader
 import coil.ImageLoaderFactory
 import kotlinx.coroutines.CoroutineScope
@@ -20,6 +22,7 @@ import java.net.URLEncoder
 import java.util.Collections
 import java.util.Locale
 import java.util.concurrent.TimeUnit
+import java.util.zip.ZipInputStream
 
 const val USER_AGENT = "MangaShelf-Android/1.0 (personal reader)"
 
@@ -309,6 +312,25 @@ object Downloader {
         return true
     }
 
+    /** Import CBZ/ZIP files and image folders from a folder the user picked (e.g. sent from the PC). */
+    fun startImport(ctx: Context, tree: Uri) {
+        val app = ctx.applicationContext
+        scope.launch {
+            busy.value = true
+            progress.value = 0f
+            try {
+                val n = Importer.run(app, tree)
+                status.value = if (n > 0) "Imported $n chapters." else
+                    "Nothing new to import there (looking for CBZ/ZIP files or chapter folders with pictures)."
+            } catch (e: Exception) {
+                status.value = "Import failed: ${e.message}"
+            } finally {
+                busy.value = false
+                bump()
+            }
+        }
+    }
+
     fun cancel() {
         gen++
         queued.clear()
@@ -378,5 +400,89 @@ object Downloader {
             queued.remove(job.mangaId)
             bump()
         }
+    }
+}
+
+// ------------------------------------------------------------------ import from phone storage
+object Importer {
+    private fun isArchive(f: DocumentFile): Boolean {
+        val n = (f.name ?: "").lowercase(Locale.ROOT)
+        return f.isFile && (n.endsWith(".cbz") || n.endsWith(".zip"))
+    }
+
+    private fun isImage(f: DocumentFile): Boolean =
+        f.isFile && (f.name ?: "").substringAfterLast('.', "").lowercase(Locale.ROOT) in Library.imgExt
+
+    private fun hasImages(d: DocumentFile): Boolean = d.listFiles().any { isImage(it) }
+
+    fun run(ctx: Context, tree: Uri): Int {
+        val root = DocumentFile.fromTreeUri(ctx, tree) ?: return 0
+        val kids = root.listFiles()
+        // Picked one manga's folder, or a folder that holds several manga folders?
+        val seriesDirs = if (kids.any { isArchive(it) } || kids.any { it.isDirectory && hasImages(it) }) {
+            listOf(root)
+        } else {
+            kids.filter { it.isDirectory }
+        }
+        var total = 0
+        for (s in seriesDirs) total += importSeries(ctx, s)
+        return total
+    }
+
+    private fun importSeries(ctx: Context, src: DocumentFile): Int {
+        val seriesName = Library.cleanName(src.name ?: "Imported")
+        val dir = File(Library.root, seriesName).apply { mkdirs() }
+        val items = src.listFiles().sortedBy { Library.natKey(it.name ?: "") }
+        var count = 0
+        for (f in items) {
+            val name = f.name ?: continue
+            when {
+                f.isFile && (name == "cover.jpg" || name == "info.json") -> {
+                    val out = File(dir, name)
+                    if (!out.exists()) copy(ctx, f, out)
+                }
+                isArchive(f) -> {
+                    val cdir = File(dir, Library.cleanName(name.substringBeforeLast('.')))
+                    if (Library.isDone(cdir)) continue
+                    Downloader.status.value = "Importing $seriesName: ${cdir.name}..."
+                    cdir.mkdirs()
+                    var pages = 0
+                    ctx.contentResolver.openInputStream(f.uri)?.use { input ->
+                        ZipInputStream(input.buffered()).use { zin ->
+                            var e = zin.nextEntry
+                            while (e != null) {
+                                val ext = e.name.substringAfterLast('.', "").lowercase(Locale.ROOT)
+                                if (!e.isDirectory && ext in Library.imgExt) {
+                                    val out = File(cdir, Library.cleanName(e.name.replace('/', '_').replace('\\', '_')))
+                                    out.outputStream().use { o -> zin.copyTo(o) }
+                                    pages++
+                                }
+                                e = zin.nextEntry
+                            }
+                        }
+                    }
+                    if (pages > 0) { File(cdir, ".done").writeText(""); count++ } else cdir.deleteRecursively()
+                    Downloader.bump()
+                }
+                f.isDirectory && hasImages(f) -> {
+                    val cdir = File(dir, Library.cleanName(name))
+                    if (Library.isDone(cdir)) continue
+                    Downloader.status.value = "Importing $seriesName: ${cdir.name}..."
+                    cdir.mkdirs()
+                    var pages = 0
+                    for (img in f.listFiles().filter { isImage(it) }) {
+                        copy(ctx, img, File(cdir, Library.cleanName(img.name ?: "page.jpg")))
+                        pages++
+                    }
+                    if (pages > 0) { File(cdir, ".done").writeText(""); count++ }
+                    Downloader.bump()
+                }
+            }
+        }
+        return count
+    }
+
+    private fun copy(ctx: Context, f: DocumentFile, out: File) {
+        ctx.contentResolver.openInputStream(f.uri)?.use { i -> out.outputStream().use { o -> i.copyTo(o) } }
     }
 }

@@ -12,8 +12,8 @@ android {
         applicationId = "com.mangashelf.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1"
     }
 
     // Fixed key so new versions install over old ones (and keep your downloads)
@@ -49,4 +49,5 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("io.coil-kt:coil-compose:2.7.0")
+    implementation("androidx.documentfile:documentfile:1.0.1")
 }

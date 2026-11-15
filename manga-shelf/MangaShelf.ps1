@@ -822,12 +822,49 @@ function Send-ToPhone([string]$folder) {
     $target.GetFolder.CopyHere($folder, 16)
     $Status.Text = "Copying to $destName (see the Windows copy window)."
     Show-Msg ("Copying '$(Split-Path $folder -Leaf)' to:`n$destName`n`nA Windows copy window shows the progress. Keep the phone plugged in until it finishes.`n`n" +
-              "To read on the phone, open that folder in any comic reader app that supports CBZ files.")
+              "On the phone, open the MangaShelf app, tap 'Import' in your Library and pick that MangaShelf folder.`n`n" +
+              "(Tip: if the MangaShelf phone app is installed, open it once - next time the PC can send straight into it.)")
+}
+
+function Get-ChildFolder($folder, [string]$name) {
+    if (-not $folder) { return $null }
+    @($folder.Items()) | Where-Object { $_.IsFolder -and $_.Name -eq $name } | Select-Object -First 1
+}
+
+# Copy straight into the MangaShelf Android app's library (Android/data/com.mangashelf.app/files/Manga).
+# Returns $true if the copy started.
+function Send-ToPhoneApp($s) {
+    $phone = Find-Phone
+    if (-not $phone) { return $false }
+    $storage = @($phone.GetFolder.Items()) | Where-Object { $_.IsFolder } | Select-Object -First 1
+    if (-not $storage) { return $false }
+    $node = $storage
+    foreach ($part in 'Android', 'data', 'com.mangashelf.app', 'files') {
+        $node = Get-ChildFolder $node.GetFolder $part
+        if (-not $node) { return $false }
+    }
+    $manga = Get-ChildFolder $node.GetFolder 'Manga'
+    if (-not $manga) {
+        try { $node.GetFolder.NewFolder('Manga') } catch { }
+        Start-Sleep -Milliseconds 1000
+        $manga = Get-ChildFolder $node.GetFolder 'Manga'
+    }
+    if (-not $manga) { return $false }
+    $manga.GetFolder.CopyHere($s.Dir, 16)
+    $Status.Text = "Sending '$($s.Name)' to the MangaShelf app on $($phone.Name)..."
+    Show-Msg ("Sending '$($s.Name)' straight into the MangaShelf app on $($phone.Name).`n`n" +
+              "A Windows copy window shows the progress. Keep the phone plugged in until it finishes, " +
+              "then open MangaShelf on the phone - it will be in your Library.")
+    return $true
 }
 
 function Start-PhoneExport {
     $s = $SeriesList.SelectedItem
     if (-not $s) { Show-Msg 'Pick a manga on the left first.'; return }
+    $sent = $false
+    try { $sent = Send-ToPhoneApp $s } catch { $sent = $false }
+    if ($sent) { return }
+    # Phone app folder not reachable: pack as CBZ and copy to a normal MangaShelf folder instead
     $queue.Enqueue([pscustomobject]@{ Type = 'export'; Series = $s.Name; Dir = $s.Dir; OutRoot = $PhoneExport; Gen = $sync.Gen; Id = $null; Title = $s.Name })
     $Status.Text = "Packing '$($s.Name)' for your phone..."
 }

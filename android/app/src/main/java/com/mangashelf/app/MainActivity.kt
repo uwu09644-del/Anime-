@@ -7,6 +7,8 @@ import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -68,6 +70,12 @@ class MainActivity : ComponentActivity() {
                 Surface(Modifier.fillMaxSize(), color = Color(0xFF121212)) { AppRoot() }
             }
         }
+    }
+
+    // Re-read the library whenever the app comes back (e.g. after the PC sent manga over USB)
+    override fun onResume() {
+        super.onResume()
+        Downloader.bump()
     }
 }
 
@@ -148,8 +156,16 @@ fun DownloadStatusBar() {
 // ------------------------------------------------------------------ library
 @Composable
 fun LibraryTab(onOpen: (File) -> Unit, onGoSearch: () -> Unit) {
+    val ctx = LocalContext.current
     val changes by Downloader.changes.collectAsState()
     val series = remember(changes) { Library.series() }
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri != null) {
+            runCatching { ctx.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+            Downloader.startImport(ctx, uri)
+            toast(ctx, "Importing...")
+        }
+    }
 
     if (series.isEmpty()) {
         Column(
@@ -162,13 +178,18 @@ fun LibraryTab(onOpen: (File) -> Unit, onGoSearch: () -> Unit) {
             Text("Search for a manga and download it to read here, even offline.", textAlign = TextAlign.Center, color = Dim)
             Spacer(Modifier.height(16.dp))
             Button(onClick = onGoSearch) { Text("Search manga") }
+            Spacer(Modifier.height(8.dp))
+            OutlinedButton(onClick = { picker.launch(null) }) { Text("Import from phone storage") }
         }
         return
     }
 
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(8.dp)) {
         item {
-            Text("My manga", fontSize = 22.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(8.dp))
+            Row(Modifier.fillMaxWidth().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text("My manga", fontSize = 22.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                OutlinedButton(onClick = { picker.launch(null) }) { Text("Import") }
+            }
         }
         items(series, key = { it.name }) { s ->
             val chs = remember(changes, s) { Library.chapters(s) }
