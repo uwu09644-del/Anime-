@@ -135,7 +135,7 @@ function Get-MangaTitle($attrs) {
 
 # ---------------------------------------------------------------- background downloader
 # Runs in its own runspace so the window never freezes. Talks to the UI through $sync.
-$sync  = [hashtable]::Synchronized(@{ InfoChanged = $false; Counts = [hashtable]::Synchronized(@{}); CoversChanged = $false; Status = 'Ready'; Progress = 0; LibraryChanged = $false; Gen = 0; CurrentId = $null; Quit = $false })
+$sync  = [hashtable]::Synchronized(@{ ExportReady = $null; InfoChanged = $false; Counts = [hashtable]::Synchronized(@{}); CoversChanged = $false; Status = 'Ready'; Progress = 0; LibraryChanged = $false; Gen = 0; CurrentId = $null; Quit = $false })
 $queue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
 
 $worker = {
@@ -188,7 +188,7 @@ $worker = {
         return 'Extra - ' + (Clean-Name $t)
     }
 
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
     $imgExt = @('.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp')
     function Nat([string]$s) { [regex]::Replace($s, '\d+', { param($m) $m.Value.PadLeft(10, '0') }) }
 
@@ -234,11 +234,50 @@ $worker = {
         $sync.Status = "Imported $n item(s) into '$($job.Series)'."
     }
 
+    # Pack a series as one CBZ per chapter (for phone reader apps)
+    function Export-Job($job) {
+        $out = Join-Path $job.OutRoot (Clean-Name $job.Series)
+        [void][IO.Directory]::CreateDirectory($out)
+        $chs = @(Get-ChildItem -LiteralPath $job.Dir -Directory | Where-Object { [IO.File]::Exists((Join-Path $_.FullName '.done')) } |
+                 Sort-Object { Nat $_.Name })
+        $n = 0
+        foreach ($c in $chs) {
+            if ($job.Gen -ne $sync.Gen -or $sync.Quit) { $sync.Status = 'Cancelled.'; return }
+            $n++
+            $sync.Progress = [int](100 * ($n - 1) / [Math]::Max(1, $chs.Count))
+            $sync.Status = "Packing $($c.Name) for your phone ($n/$($chs.Count))..."
+            $cbz = Join-Path $out ($c.Name + '.cbz')
+            if ([IO.File]::Exists($cbz)) { continue }
+            $imgs = @(Get-ChildItem -LiteralPath $c.FullName -File | Where-Object { $imgExt -contains $_.Extension.ToLower() } | Sort-Object { Nat $_.Name })
+            if ($imgs.Count -eq 0) { continue }
+            if ([IO.File]::Exists("$cbz.part")) { [IO.File]::Delete("$cbz.part") }
+            $zip = [IO.Compression.ZipFile]::Open("$cbz.part", [IO.Compression.ZipArchiveMode]::Create)
+            try {
+                foreach ($f in $imgs) {
+                    [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $f.FullName, $f.Name, [IO.Compression.CompressionLevel]::NoCompression)
+                }
+            } finally { $zip.Dispose() }
+            [IO.File]::Move("$cbz.part", $cbz)
+        }
+        $cover = Join-Path $job.Dir 'cover.jpg'
+        if ([IO.File]::Exists($cover)) { [IO.File]::Copy($cover, (Join-Path $out 'cover.jpg'), $true) }
+        $sync.Progress = 100
+        if ($n -eq 0) { $sync.Status = "$($job.Series): no finished chapters to send yet."; return }
+        $sync.Status = "Packed $n chapters of $($job.Series). Sending to phone..."
+        $sync.ExportReady = $out
+    }
+
     while (-not $sync.Quit) {
         $job = $null
         if (-not $queue.TryDequeue([ref]$job)) { Start-Sleep -Milliseconds 300; continue }
         if ($job.Gen -ne $sync.Gen) { continue }       # cancelled before it started
 
+        if ($job.Type -eq 'export') {
+            $sync.CurrentId = 'export'
+            try { Export-Job $job } catch { $sync.Status = "Packing for phone failed: $($_.Exception.Message)" }
+            finally { $sync.CurrentId = $null }
+            continue
+        }
         if ($job.Type -eq 'import') {
             $sync.CurrentId = 'import'
             try { Import-Job $job } catch { $sync.Status = "Import failed: $($_.Exception.Message)" }
@@ -440,6 +479,7 @@ $MainXaml = @'
               <Button x:Name="ContinueBtn" Content="Continue reading"/>
               <Button x:Name="ReadBtn" Content="Read selected"/>
               <Button x:Name="UpdateBtn" Content="Check for new chapters"/>
+              <Button x:Name="PhoneBtn" Content="Send to phone"/>
             </StackPanel>
             <ListBox x:Name="ChapterList" Background="#252526" Foreground="#EEEEEE" BorderThickness="0" FontSize="14">
               <ListBox.ItemTemplate>
@@ -550,7 +590,7 @@ $ReaderXaml = @'
 
 $win = Load-Xaml $MainXaml
 foreach ($n in 'CancelBtn', 'Progress', 'Status', 'Tabs', 'RefreshBtn', 'FolderBtn', 'SeriesList', 'SeriesTitle',
-               'ContinueBtn', 'ReadBtn', 'UpdateBtn', 'ChapterList', 'SearchBtn', 'LangBox', 'SearchBox', 'DownloadBtn', 'Results', 'OfficialBtn', 'ImportBtn', 'ImportDirBtn') {
+               'ContinueBtn', 'ReadBtn', 'UpdateBtn', 'ChapterList', 'SearchBtn', 'LangBox', 'SearchBox', 'DownloadBtn', 'Results', 'OfficialBtn', 'ImportBtn', 'ImportDirBtn', 'PhoneBtn') {
     Set-Variable -Name $n -Value $win.FindName($n) -Scope Script
 }
 
@@ -746,6 +786,52 @@ function Download-Selected {
     Queue-Download $m.Id $m.Title $m.Lang $m.CoverBig
 }
 
+# ---------------------------------------------------------------- send to phone (USB)
+$PhoneExport = Join-Path $HOME 'MangaShelf-phone'
+
+function Find-Phone {
+    $shell = New-Object -ComObject Shell.Application
+    foreach ($it in @($shell.NameSpace(17).Items())) {        # 17 = This PC
+        if ($it.IsFolder -and $it.Path -match '\\\\\?\\(usb|swd)#') { return $it }
+    }
+    return $null
+}
+
+function Send-ToPhone([string]$folder) {
+    $help = "On the phone: unlock it, tap the USB notification and choose 'File transfer'."
+    $phone = Find-Phone
+    if (-not $phone) {
+        Show-Msg "No phone found.`n`n$help Then press 'Send to phone' again.`n`nThe manga is already packed as CBZ files here, and you can also drag this folder to the phone yourself:`n$folder"
+        Start-Process explorer.exe -ArgumentList "`"$folder`""
+        return
+    }
+    $storage = @($phone.GetFolder.Items()) | Where-Object { $_.IsFolder } | Select-Object -First 1
+    if (-not $storage) {
+        Show-Msg "'$($phone.Name)' is connected but its storage is locked.`n`n$help Then press 'Send to phone' again."
+        return
+    }
+    $root = $storage.GetFolder
+    $target = @($root.Items()) | Where-Object { $_.Name -eq 'MangaShelf' } | Select-Object -First 1
+    if (-not $target) {
+        try { $root.NewFolder('MangaShelf') } catch { }
+        Start-Sleep -Milliseconds 1000
+        $target = @($root.Items()) | Where-Object { $_.Name -eq 'MangaShelf' } | Select-Object -First 1
+    }
+    $destName = if ($target) { "$($phone.Name) > $($storage.Name) > MangaShelf" } else { "$($phone.Name) > $($storage.Name)" }
+    if (-not $target) { $target = $storage }
+    $target.GetFolder.CopyHere($folder, 16)
+    $Status.Text = "Copying to $destName (see the Windows copy window)."
+    Show-Msg ("Copying '$(Split-Path $folder -Leaf)' to:`n$destName`n`nA Windows copy window shows the progress. Keep the phone plugged in until it finishes.`n`n" +
+              "To read on the phone, open that folder in any comic reader app that supports CBZ files.")
+}
+
+function Start-PhoneExport {
+    $s = $SeriesList.SelectedItem
+    if (-not $s) { Show-Msg 'Pick a manga on the left first.'; return }
+    $queue.Enqueue([pscustomobject]@{ Type = 'export'; Series = $s.Name; Dir = $s.Dir; OutRoot = $PhoneExport; Gen = $sync.Gen; Id = $null; Title = $s.Name })
+    $Status.Text = "Packing '$($s.Name)' for your phone..."
+}
+
 # ---------------------------------------------------------------- import your own files
 function Guess-SeriesName([string]$path) {
     $n = [IO.Path]::GetFileNameWithoutExtension($path.TrimEnd('\'))
@@ -802,6 +888,7 @@ $DownloadBtn.Add_Click({ Download-Selected })
 $Results.Add_MouseDoubleClick({ Download-Selected })
 $OfficialBtn.Add_Click({ Open-Official $Results.SelectedItem })
 $ImportBtn.Add_Click({ Import-Files })
+$PhoneBtn.Add_Click({ Start-PhoneExport })
 $ImportDirBtn.Add_Click({ Import-Folder })
 
 $RefreshBtn.Add_Click({ Refresh-Library })
@@ -850,6 +937,11 @@ $timer.Add_Tick({
             }
         }
         if ($changed) { $Results.Items.Refresh() }
+    }
+    if ($sync.ExportReady) {
+        $f = $sync.ExportReady
+        $sync.ExportReady = $null
+        try { Send-ToPhone $f } catch { Show-Msg "Could not copy to the phone: $($_.Exception.Message)`n`nThe CBZ files are in:`n$f"; Start-Process explorer.exe -ArgumentList "`"$f`"" }
     }
     if ($sync.InfoChanged) {
         $sync.InfoChanged = $false
